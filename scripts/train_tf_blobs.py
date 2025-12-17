@@ -8,6 +8,9 @@ Key characteristics:
 - Logit-based loss for numerical stability
 - Minimal structure intended for extensibility
 """
+import os
+# Suppress TensorFlow warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import sys
 from pathlib import Path
@@ -19,31 +22,41 @@ import tensorflow as tf
 
 from src.data_blobs import make_blobs
 
+
 """Load experiment configuration."""
 def load_cfg(path: str):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
+
 # Training pipeline
 def main():
-    # Load experiment parameters
     cfg = load_cfg("configs/blobs.yaml")
     tf.random.set_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
 
-    # Generate synthetic data
+    # Generate synthetic dataset
     X, y = make_blobs(n=cfg["n_samples"], seed=cfg["seed"])
 
-    # Create dataset pipeline
-    ds = tf.data.Dataset.from_tensor_slices((X, y))
-    ds = ds.shuffle(cfg["n_samples"], seed=cfg["seed"]).batch(cfg["batch_size"]).prefetch(tf.data.AUTOTUNE)
+    # Deterministic train/val split (framework-agnostic)
+    n_val = int(cfg["n_samples"] * cfg["val_ratio"])
+    X_train, X_val = X[:-n_val], X[-n_val:]
+    y_train, y_val = y[:-n_val], y[-n_val:]
 
-    # Define model architecture
+    # Create dataset pipeline (train only; validation evaluated explicitly)
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices((X_train, y_train))
+        .shuffle(len(X_train), seed=cfg["seed"])
+        .batch(cfg["batch_size"])
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Define model architecture (outputs logits)
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(2,)),
         tf.keras.layers.Dense(cfg["hidden"], activation="relu"),
         tf.keras.layers.Dense(cfg["hidden"], activation="relu"),
-        tf.keras.layers.Dense(1)  # logits
+        tf.keras.layers.Dense(1),
     ])
 
     # Define loss function and optimizer
@@ -62,25 +75,24 @@ def main():
 
     # Epoch loop
     for epoch in range(cfg["epochs"]):
-        epoch_losses = []
+        train_losses = []
 
-        # Mini-batch training
-        for xb, yb in ds:
+        for xb, yb in train_ds:
             loss = train_step(xb, yb)
-            epoch_losses.append(loss.numpy())
+            train_losses.append(loss.numpy())
 
-        # Lightweight evaluation on training data
-        logits = model(X, training=False).numpy().reshape(-1)
-        probs = 1.0 / (1.0 + np.exp(-logits))
-        preds = (probs > 0.5).astype(np.float32)
-        acc = (preds == y).mean()
+        # Evaluate on validation split
+        val_logits = model(X_val, training=False).numpy().reshape(-1)
+        val_probs = 1.0 / (1.0 + np.exp(-val_logits))
+        val_preds = (val_probs > 0.5).astype(np.float32)
+        val_acc = (val_preds == y_val).mean()
 
-        # Metrics reporting
         print(
             f"TF Epoch {epoch + 1:02d} | "
-            f"loss={float(np.mean(epoch_losses)):.4f} | "
-            f"acc={acc:.4f}"
+            f"train_loss={float(np.mean(train_losses)):.4f} | "
+            f"val_acc={val_acc:.4f}"
         )
+
 
 if __name__ == "__main__":
     main()
